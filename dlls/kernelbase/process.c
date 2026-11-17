@@ -589,7 +589,31 @@ static int battleye_launcher_redirect_hack( const WCHAR *app_name, WCHAR *new_na
     return 1;
 }
 
-static const WCHAR *hack_append_command_line( const WCHAR *cmd )
+/* Аргументы из WINE_APPEND_ARGS: записи «программа=аргументы» через «;»
+ * Программа ищется подстрокой в командной строке, как в таблице ниже
+ * Так оболочка задаёт флаги встроенным браузерам лаунчеров без пересборки Wine */
+static const WCHAR *env_append_command_line( const WCHAR *cmd, WCHAR *buf, DWORD buflen )
+{
+    WCHAR spec[1024], *entry, *next, *eq;
+    DWORD len = GetEnvironmentVariableW( L"WINE_APPEND_ARGS", spec, ARRAY_SIZE(spec) );
+
+    if (!len || len >= ARRAY_SIZE(spec)) return NULL;
+    for (entry = spec; entry; entry = next)
+    {
+        if ((next = wcschr( entry, ';' ))) *next++ = 0;
+        if (!(eq = wcschr( entry, '=' )) || eq == entry) continue;
+        *eq = 0;
+        if (!wcsstr( cmd, entry )) continue;
+        if (lstrlenW( eq + 1 ) + 2 > buflen) return NULL;
+        buf[0] = ' ';
+        lstrcpyW( buf + 1, eq + 1 );
+        TRACE( "appending %s from WINE_APPEND_ARGS\n", debugstr_w(buf) );
+        return buf;
+    }
+    return NULL;
+}
+
+static const WCHAR *hack_append_command_line( const WCHAR *cmd, WCHAR *buf, DWORD buflen )
 {
     static const struct
     {
@@ -626,10 +650,12 @@ static const WCHAR *hack_append_command_line( const WCHAR *cmd )
         {L"UnrealCEFSubProcess.exe", L" --use-gl=swiftshader", "2316580"},
         {L"UnrealCEFSubProcess.exe", L" --use-angle=d3d9", "2684500"},
     };
+    const WCHAR *ret;
     unsigned int i;
     char sgi[64];
 
     if (!cmd) return NULL;
+    if ((ret = env_append_command_line( cmd, buf, buflen ))) return ret;
 
     for (i = 0; i < ARRAY_SIZE(options); ++i)
     {
@@ -693,6 +719,7 @@ BOOL WINAPI DECLSPEC_HOTPATCH CreateProcessInternalW( HANDLE token, const WCHAR 
     RTL_USER_PROCESS_INFORMATION rtl_info = { 0 };
     HANDLE parent = 0, debug = 0;
     char *product_name = NULL;
+    WCHAR append_buf[1024];
     const WCHAR *append;
     ULONG nt_flags = 0;
     USHORT machine = 0;
@@ -712,7 +739,7 @@ BOOL WINAPI DECLSPEC_HOTPATCH CreateProcessInternalW( HANDLE token, const WCHAR 
                 return FALSE;
             swprintf( tidy_cmdline, lstrlenW(app_name) + 3, L"\"%s\"", app_name );
         }
-        else if ((append = hack_append_command_line( app_name )))
+        else if ((append = hack_append_command_line( app_name, append_buf, ARRAY_SIZE(append_buf) )))
         {
             tidy_cmdline = RtlAllocateHeap( GetProcessHeap(), 0,
                                             sizeof(WCHAR) * (lstrlenW(cmd_line) + lstrlenW(append) + 1) );
@@ -724,7 +751,7 @@ BOOL WINAPI DECLSPEC_HOTPATCH CreateProcessInternalW( HANDLE token, const WCHAR 
     {
         WCHAR *cmdline_new = NULL;
 
-        if ((append = hack_append_command_line( cmd_line )))
+        if ((append = hack_append_command_line( cmd_line, append_buf, ARRAY_SIZE(append_buf) )))
         {
             cmdline_new = RtlAllocateHeap( GetProcessHeap(), 0, sizeof(WCHAR)
                                            * (lstrlenW(cmd_line) + lstrlenW(append) + 1) );
