@@ -3257,9 +3257,11 @@ static IMAGE_BASE_RELOCATION *process_relocation_block( char *page, IMAGE_BASE_R
  * каждую секцию в анонимную память отдельно в каждом процессе
  * Копия хранит данные секции по смещению, равному её VirtualAddress, — такие страницы mmap отображает из файла:
  * Они общие у всех процессов и вытесняются как файловый кэш, а не держатся в RAM и свопе
- * Заголовок в первых байтах копии ловит смену исходника по размеру и времени изменения
+ * Релокации в копии уже применены под адрес загрузки: иначе запись поправок переписала бы страницы кода
+ * в каждом процессе, и они снова стали бы анонимными
+ * Адрес загрузки входит в имя копии, заголовок в первых байтах ловит смену исходника
  */
-#define IMAGE_CACHE_MAGIC     0x31434d49  /* "IMC1" */
+#define IMAGE_CACHE_MAGIC     0x32434d49  /* "IMC2" */
 #define IMAGE_CACHE_MIN_BYTES (1024 * 1024)
 
 struct image_cache_header
@@ -3269,6 +3271,7 @@ struct image_cache_header
     UINT64 size;
     INT64  mtime_sec;
     INT64  mtime_nsec;
+    UINT64 base;
 };
 
 static BOOL image_cache_enabled(void)
@@ -3282,28 +3285,32 @@ static BOOL image_cache_enabled(void)
     return enabled;
 }
 
-static BOOL image_cache_header_matches( int fd, const struct stat *st, UINT nsec )
+static BOOL image_cache_header_matches( int fd, const struct stat *st, UINT nsec, UINT64 base )
 {
     struct image_cache_header hdr;
 
     if (pread( fd, &hdr, sizeof(hdr), 0 ) != sizeof(hdr)) return FALSE;
     return hdr.magic == IMAGE_CACHE_MAGIC && hdr.sections == nsec && hdr.size == (UINT64)st->st_size &&
-           hdr.mtime_sec == (INT64)st->st_mtim.tv_sec && hdr.mtime_nsec == (INT64)st->st_mtim.tv_nsec;
+           hdr.mtime_sec == (INT64)st->st_mtim.tv_sec && hdr.mtime_nsec == (INT64)st->st_mtim.tv_nsec &&
+           hdr.base == base;
 }
 
 /***********************************************************************
  *           open_aligned_image_copy
  *
- * Возвращает fd выровненной копии образа или -1, если копия не нужна или не получилась
- * Тогда секции читаются старым путём, через pread
+ * Возвращает fd выровненной копии образа, уже перемещённой на map_base, или -1
+ * -1 — копия не нужна или не получилась, тогда секции читаются старым путём, через pread
  */
-static int open_aligned_image_copy( int fd, const struct stat *st, const IMAGE_SECTION_HEADER *sec, UINT nsec )
+static int open_aligned_image_copy( int fd, const struct stat *st, const IMAGE_NT_HEADERS *nt,
+                                    const IMAGE_SECTION_HEADER *sec, UINT nsec, SIZE_T total_size,
+                                    UINT64 map_base, INT_PTR delta )
 {
     static const SIZE_T sector_align = 0x1ff;
-    char dir[1024], path[1200], tmp[1300];
+    char dir[1024], path[1300], tmp[1400];
     struct image_cache_header hdr;
-    SIZE_T unaligned = 0, max_size;
-    char *buf = NULL;
+    const IMAGE_DATA_DIRECTORY *reloc_dir;
+    SIZE_T unaligned = 0;
+    char *image = NULL;
     int cache_fd, i;
 
     if (!image_cache_enabled() || !config_dir || host_page_size != 0x1000) return -1;
@@ -3313,28 +3320,28 @@ static int open_aligned_image_copy( int fd, const struct stat *st, const IMAGE_S
     {
         SIZE_T file_start = sec[i].PointerToRawData & ~sector_align;
         if (sec[i].VirtualAddress < sizeof(hdr) || (sec[i].VirtualAddress & host_page_mask)) return -1;
+        /* общие записываемые секции отображаются из shared_fd мимо копии, а релокации копии их бы пропустили */
+        if ((sec[i].Characteristics & IMAGE_SCN_MEM_SHARED) && (sec[i].Characteristics & IMAGE_SCN_MEM_WRITE))
+            return -1;
+        if (sec[i].VirtualAddress >= total_size || sec[i].SizeOfRawData > total_size - sec[i].VirtualAddress)
+            return -1;
         if (sec[i].PointerToRawData && sec[i].SizeOfRawData && (file_start & host_page_mask))
             unaligned += sec[i].SizeOfRawData;
     }
     if (unaligned < IMAGE_CACHE_MIN_BYTES) return -1;
 
     snprintf( dir, sizeof(dir), "%s/image_cache", config_dir );
-    snprintf( path, sizeof(path), "%s/%llx-%llx.img", dir, (unsigned long long)st->st_dev,
-              (unsigned long long)st->st_ino );
+    snprintf( path, sizeof(path), "%s/%llx-%llx-%llx.img", dir, (unsigned long long)st->st_dev,
+              (unsigned long long)st->st_ino, (unsigned long long)map_base );
 
     if ((cache_fd = open( path, O_RDONLY | O_CLOEXEC )) != -1)
     {
-        if (image_cache_header_matches( cache_fd, st, nsec )) return cache_fd;
+        if (image_cache_header_matches( cache_fd, st, nsec, map_base )) return cache_fd;
         close( cache_fd );
     }
 
-    mkdir( dir, 0777 );
-    snprintf( tmp, sizeof(tmp), "%s.%d.tmp", path, (int)getpid() );
-    if ((cache_fd = open( tmp, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0666 )) == -1) return -1;
-
-    for (i = 0, max_size = 0; i < nsec; i++) max_size = max( max_size, (SIZE_T)sec[i].SizeOfRawData + 0x400 );
-    if (!(buf = malloc( max_size ))) goto failed;
-
+    /* образ собирается в памяти целиком: релокации ссылаются на любые страницы любых секций */
+    if (!(image = calloc( 1, total_size ))) return -1;
     for (i = 0; i < nsec; i++)
     {
         SIZE_T file_start = sec[i].PointerToRawData & ~sector_align;
@@ -3342,10 +3349,31 @@ static int open_aligned_image_copy( int fd, const struct stat *st, const IMAGE_S
         ssize_t got;
 
         if (!sec[i].PointerToRawData || !sec[i].SizeOfRawData) continue;
-        if (file_size > max_size) file_size = max_size;
-        if ((got = pread( fd, buf, file_size, file_start )) < 0) goto failed;
-        if ((SIZE_T)got < file_size) memset( buf + got, 0, file_size - got );
-        if (pwrite( cache_fd, buf, file_size, sec[i].VirtualAddress ) != (ssize_t)file_size) goto failed;
+        if (file_size > total_size - sec[i].VirtualAddress) file_size = total_size - sec[i].VirtualAddress;
+        if ((got = pread( fd, image + sec[i].VirtualAddress, file_size, file_start )) < 0) goto failed_mem;
+    }
+
+    if (delta && (reloc_dir = get_data_dir( (IMAGE_NT_HEADERS *)nt, total_size, IMAGE_DIRECTORY_ENTRY_BASERELOC )))
+    {
+        IMAGE_BASE_RELOCATION *rel = (IMAGE_BASE_RELOCATION *)(image + reloc_dir->VirtualAddress);
+        IMAGE_BASE_RELOCATION *end = (IMAGE_BASE_RELOCATION *)((char *)rel + reloc_dir->Size);
+
+        while (rel && rel < end - 1 && rel->SizeOfBlock && rel->VirtualAddress < total_size)
+            rel = process_relocation_block( image + rel->VirtualAddress, rel, delta );
+    }
+
+    mkdir( dir, 0777 );
+    snprintf( tmp, sizeof(tmp), "%s.%d.tmp", path, (int)getpid() );
+    if ((cache_fd = open( tmp, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0666 )) == -1) goto failed_mem;
+
+    for (i = 0; i < nsec; i++)
+    {
+        SIZE_T size = ROUND_SIZE( sec[i].PointerToRawData, sec[i].SizeOfRawData, sector_align );
+
+        if (!sec[i].PointerToRawData || !sec[i].SizeOfRawData) continue;
+        if (size > total_size - sec[i].VirtualAddress) size = total_size - sec[i].VirtualAddress;
+        if (pwrite( cache_fd, image + sec[i].VirtualAddress, size, sec[i].VirtualAddress ) != (ssize_t)size)
+            goto failed;
     }
 
     hdr.magic = IMAGE_CACHE_MAGIC;
@@ -3353,18 +3381,20 @@ static int open_aligned_image_copy( int fd, const struct stat *st, const IMAGE_S
     hdr.size = st->st_size;
     hdr.mtime_sec = st->st_mtim.tv_sec;
     hdr.mtime_nsec = st->st_mtim.tv_nsec;
+    hdr.base = map_base;
     if (pwrite( cache_fd, &hdr, sizeof(hdr), 0 ) != sizeof(hdr)) goto failed;
     if (rename( tmp, path ) == -1) goto failed;
 
-    free( buf );
+    free( image );
     TRACE_(module)( "built aligned image copy %s\n", path );
     return cache_fd;
 
 failed:
-    WARN_(module)( "could not build aligned image copy %s: %s\n", path, strerror( errno ));
-    free( buf );
     close( cache_fd );
     unlink( tmp );
+failed_mem:
+    WARN_(module)( "could not build aligned image copy %s: %s\n", path, strerror( errno ));
+    free( image );
     return -1;
 }
 
@@ -3452,7 +3482,13 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
 
     /* map all the sections */
 
-    if (!removable) aligned_fd = open_aligned_image_copy( fd, &st, sec, nt->FileHeader.NumberOfSections );
+    if (!removable)
+    {
+        UINT64 map_base = image_info->map_addr ? image_info->map_addr : image_info->base;
+        INT_PTR reloc_delta = image_info->map_addr ? image_info->map_addr - image_info->base : 0;
+        aligned_fd = open_aligned_image_copy( fd, &st, nt, sec, nt->FileHeader.NumberOfSections, total_size,
+                                              map_base, reloc_delta );
+    }
 
     for (i = pos = 0; i < nt->FileHeader.NumberOfSections; i++)
     {
@@ -3576,7 +3612,8 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
         else
             ((IMAGE_NT_HEADERS32 *)nt)->OptionalHeader.ImageBase = image_info->map_addr;
 
-        if ((dir = get_data_dir( nt, total_size, IMAGE_DIRECTORY_ENTRY_BASERELOC )))
+        /* выровненная копия уже перемещена на этот адрес, повторная запись поправок испортила бы данные */
+        if (aligned_fd == -1 && (dir = get_data_dir( nt, total_size, IMAGE_DIRECTORY_ENTRY_BASERELOC )))
         {
             IMAGE_BASE_RELOCATION *rel = (IMAGE_BASE_RELOCATION *)(ptr + dir->VirtualAddress);
             IMAGE_BASE_RELOCATION *end = (IMAGE_BASE_RELOCATION *)((char *)rel + dir->Size);
