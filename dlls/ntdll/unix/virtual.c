@@ -3253,6 +3253,122 @@ static IMAGE_BASE_RELOCATION *process_relocation_block( char *page, IMAGE_BASE_R
 }
 
 
+/* Выровненная копия образа: секции PE лежат в файле с шагом 512 байт, mmap их не берёт, и Wine читал
+ * каждую секцию в анонимную память отдельно в каждом процессе
+ * Копия хранит данные секции по смещению, равному её VirtualAddress, — такие страницы mmap отображает из файла:
+ * Они общие у всех процессов и вытесняются как файловый кэш, а не держатся в RAM и свопе
+ * Заголовок в первых байтах копии ловит смену исходника по размеру и времени изменения
+ */
+#define IMAGE_CACHE_MAGIC     0x31434d49  /* "IMC1" */
+#define IMAGE_CACHE_MIN_BYTES (1024 * 1024)
+
+struct image_cache_header
+{
+    UINT   magic;
+    UINT   sections;
+    UINT64 size;
+    INT64  mtime_sec;
+    INT64  mtime_nsec;
+};
+
+static BOOL image_cache_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled == -1)
+    {
+        const char *env = getenv( "WINE_IMAGE_CACHE" );
+        enabled = !(env && env[0] == '0');
+    }
+    return enabled;
+}
+
+static BOOL image_cache_header_matches( int fd, const struct stat *st, UINT nsec )
+{
+    struct image_cache_header hdr;
+
+    if (pread( fd, &hdr, sizeof(hdr), 0 ) != sizeof(hdr)) return FALSE;
+    return hdr.magic == IMAGE_CACHE_MAGIC && hdr.sections == nsec && hdr.size == (UINT64)st->st_size &&
+           hdr.mtime_sec == (INT64)st->st_mtim.tv_sec && hdr.mtime_nsec == (INT64)st->st_mtim.tv_nsec;
+}
+
+/***********************************************************************
+ *           open_aligned_image_copy
+ *
+ * Возвращает fd выровненной копии образа или -1, если копия не нужна или не получилась
+ * Тогда секции читаются старым путём, через pread
+ */
+static int open_aligned_image_copy( int fd, const struct stat *st, const IMAGE_SECTION_HEADER *sec, UINT nsec )
+{
+    static const SIZE_T sector_align = 0x1ff;
+    char dir[1024], path[1200], tmp[1300];
+    struct image_cache_header hdr;
+    SIZE_T unaligned = 0, max_size;
+    char *buf = NULL;
+    int cache_fd, i;
+
+    if (!image_cache_enabled() || !config_dir || host_page_size != 0x1000) return -1;
+    if ((UINT64)st->st_size < IMAGE_CACHE_MIN_BYTES) return -1;
+
+    for (i = 0; i < nsec; i++)
+    {
+        SIZE_T file_start = sec[i].PointerToRawData & ~sector_align;
+        if (sec[i].VirtualAddress < sizeof(hdr) || (sec[i].VirtualAddress & host_page_mask)) return -1;
+        if (sec[i].PointerToRawData && sec[i].SizeOfRawData && (file_start & host_page_mask))
+            unaligned += sec[i].SizeOfRawData;
+    }
+    if (unaligned < IMAGE_CACHE_MIN_BYTES) return -1;
+
+    snprintf( dir, sizeof(dir), "%s/image_cache", config_dir );
+    snprintf( path, sizeof(path), "%s/%llx-%llx.img", dir, (unsigned long long)st->st_dev,
+              (unsigned long long)st->st_ino );
+
+    if ((cache_fd = open( path, O_RDONLY | O_CLOEXEC )) != -1)
+    {
+        if (image_cache_header_matches( cache_fd, st, nsec )) return cache_fd;
+        close( cache_fd );
+    }
+
+    mkdir( dir, 0777 );
+    snprintf( tmp, sizeof(tmp), "%s.%d.tmp", path, (int)getpid() );
+    if ((cache_fd = open( tmp, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0666 )) == -1) return -1;
+
+    for (i = 0, max_size = 0; i < nsec; i++) max_size = max( max_size, (SIZE_T)sec[i].SizeOfRawData + 0x400 );
+    if (!(buf = malloc( max_size ))) goto failed;
+
+    for (i = 0; i < nsec; i++)
+    {
+        SIZE_T file_start = sec[i].PointerToRawData & ~sector_align;
+        SIZE_T file_size = ROUND_SIZE( sec[i].PointerToRawData, sec[i].SizeOfRawData, sector_align );
+        ssize_t got;
+
+        if (!sec[i].PointerToRawData || !sec[i].SizeOfRawData) continue;
+        if (file_size > max_size) file_size = max_size;
+        if ((got = pread( fd, buf, file_size, file_start )) < 0) goto failed;
+        if ((SIZE_T)got < file_size) memset( buf + got, 0, file_size - got );
+        if (pwrite( cache_fd, buf, file_size, sec[i].VirtualAddress ) != (ssize_t)file_size) goto failed;
+    }
+
+    hdr.magic = IMAGE_CACHE_MAGIC;
+    hdr.sections = nsec;
+    hdr.size = st->st_size;
+    hdr.mtime_sec = st->st_mtim.tv_sec;
+    hdr.mtime_nsec = st->st_mtim.tv_nsec;
+    if (pwrite( cache_fd, &hdr, sizeof(hdr), 0 ) != sizeof(hdr)) goto failed;
+    if (rename( tmp, path ) == -1) goto failed;
+
+    free( buf );
+    TRACE_(module)( "built aligned image copy %s\n", path );
+    return cache_fd;
+
+failed:
+    WARN_(module)( "could not build aligned image copy %s: %s\n", path, strerror( errno ));
+    free( buf );
+    close( cache_fd );
+    unlink( tmp );
+    return -1;
+}
+
+
 /***********************************************************************
  *           map_image_into_view
  *
@@ -3276,6 +3392,7 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
     SIZE_T header_size, header_map_size, total_size = view->size;
     SIZE_T align_mask = max( image_info->alignment - 1, page_mask );
     INT_PTR delta;
+    int aligned_fd = -1;
 
     TRACE_(module)( "mapping PE file %s at %p-%p\n", debugstr_us(nt_name), ptr, ptr + total_size );
 
@@ -3334,6 +3451,8 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
 
 
     /* map all the sections */
+
+    if (!removable) aligned_fd = open_aligned_image_copy( fd, &st, sec, nt->FileHeader.NumberOfSections );
 
     for (i = pos = 0; i < nt->FileHeader.NumberOfSections; i++)
     {
@@ -3403,7 +3522,8 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
         if (sec[i].PointerToRawData >= st.st_size ||
             end > ((st.st_size + sector_align) & ~sector_align) ||
             end < file_start ||
-            map_file_into_view( view, fd, sec[i].VirtualAddress, file_size, file_start,
+            map_file_into_view( view, aligned_fd != -1 ? aligned_fd : fd, sec[i].VirtualAddress, file_size,
+                                aligned_fd != -1 ? sec[i].VirtualAddress : file_start,
                                 VPROT_COMMITTED | VPROT_READ | VPROT_WRITECOPY,
                                 removable ) != STATUS_SUCCESS)
         {
@@ -3496,6 +3616,7 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
     status = STATUS_SUCCESS;
 
 done:
+    if (aligned_fd != -1) close( aligned_fd );
     free( sections );
     return status;
 }
